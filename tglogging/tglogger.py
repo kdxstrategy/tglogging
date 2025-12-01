@@ -4,12 +4,16 @@ import asyncio
 import nest_asyncio
 import weakref
 import threading
+import html
 from logging import StreamHandler
 from aiohttp import ClientSession, FormData, ClientTimeout
 
 nest_asyncio.apply()
 
-DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
+DEFAULT_PAYLOAD = {
+    "disable_web_page_preview": True,
+    "parse_mode": "HTML",  # было "Markdown"
+}
 
 
 class TelegramLogHandler(StreamHandler):
@@ -18,6 +22,7 @@ class TelegramLogHandler(StreamHandler):
     Логи копятся и отправляются автоматически, даже после floodwait.
     """
     _handlers = weakref.WeakSet()
+    MAX_MESSAGE_LEN = 3900  # запас по длине относительно лимита 4096
 
     def __init__(
         self,
@@ -45,6 +50,9 @@ class TelegramLogHandler(StreamHandler):
         self.last_sent_content = ""
         self._handlers.add(self)
 
+        # lock для защиты буфера между потоками
+        self._lock = threading.Lock()
+
         # создаём отдельный event loop в отдельном потоке
         self.loop = asyncio.new_event_loop()
         t = threading.Thread(target=self._run_loop, daemon=True)
@@ -59,8 +67,10 @@ class TelegramLogHandler(StreamHandler):
 
     def emit(self, record):
         msg = self.format(record)
-        self.lines += 1
-        self.message_buffer.append(msg)
+        # защищаем общий буфер
+        with self._lock:
+            self.lines += 1
+            self.message_buffer.append(msg)
 
     async def _background_worker(self):
         """Фоновая задача — проверяет буфер и отправляет логи"""
@@ -68,27 +78,33 @@ class TelegramLogHandler(StreamHandler):
             try:
                 if self.floodwait > 0:
                     self.floodwait -= 1
-                elif (
-                    self.message_buffer
-                    and (
+                else:
+                    # быстрая проверка наличия буфера без лока — ок
+                    has_messages = False
+                    with self._lock:
+                        has_messages = bool(self.message_buffer)
+
+                    if has_messages and (
                         time.time() - self.last_update >= self.wait_time
                         or self.lines >= self.minimum
-                        or len("\n".join(self.message_buffer)) >= 3000
-                    )
-                ):
-                    await self.handle_logs()
-                    self.lines = 0
-                    self.last_update = time.time()
+                    ):
+                        await self.handle_logs()
+                        self.last_update = time.time()
             except Exception as e:
                 print(f"TGLogger worker error: {e}")
             await asyncio.sleep(1)
 
     async def handle_logs(self, force_send=False):
-        if not self.message_buffer or self.floodwait:
+        # если floodwait — не трогаем очередь
+        if self.floodwait:
             return
 
-        snapshot = self.message_buffer[:]
-        self.message_buffer.clear()
+        with self._lock:
+            if not self.message_buffer:
+                return
+            snapshot = self.message_buffer[:]
+            self.message_buffer.clear()
+            self.lines = 0
 
         full_message = '\n'.join(snapshot)
         if not full_message.strip():
@@ -99,32 +115,42 @@ class TelegramLogHandler(StreamHandler):
                 success = await self.initialize_bot()
                 if not success:
                     # вернуть всё в очередь
-                    self.message_buffer = snapshot + self.message_buffer
+                    with self._lock:
+                        self.message_buffer = snapshot + self.message_buffer
                     return
 
-            if self.message_id and len(self.last_sent_content + '\n' + full_message) <= 4096:
+            if (
+                self.message_id
+                and len(self.last_sent_content + '\n' + full_message)
+                <= self.MAX_MESSAGE_LEN
+            ):
                 combined_message = self.last_sent_content + '\n' + full_message
                 ok = await self.edit_message(combined_message)
                 if ok:
                     self.last_sent_content = combined_message
                 else:
-                    self.message_buffer = snapshot + self.message_buffer
+                    # вернуть назад если не получилось
+                    with self._lock:
+                        self.message_buffer = snapshot + self.message_buffer
             else:
                 chunks = self._split_into_chunks(full_message)
-                for chunk in chunks:
+                for idx, chunk in enumerate(chunks):
                     if not chunk.strip():
                         continue
                     ok = await self.send_message(chunk)
                     if not ok:
-                        # вернуть неотправленный кусок
-                        self.message_buffer.insert(0, chunk)
-                        # вернуть оставшиеся части
-                        self.message_buffer = self.message_buffer + chunks[chunks.index(chunk)+1:]
+                        # вернуть неотправленный кусок + остальные обратно в буфер
+                        with self._lock:
+                            self.message_buffer.insert(0, chunk)
+                            self.message_buffer = (
+                                self.message_buffer + chunks[idx + 1 :]
+                            )
                         break
         except Exception as e:
             print(f"Handle logs error: {e}")
             # всегда возвращаем в очередь
-            self.message_buffer = snapshot + self.message_buffer
+            with self._lock:
+                self.message_buffer = snapshot + self.message_buffer
 
     def _split_into_chunks(self, message):
         chunks = []
@@ -135,10 +161,10 @@ class TelegramLogHandler(StreamHandler):
             if line == "":
                 line = " "
 
-            while len(line) > 4096:
-                split_pos = line[:4096].rfind(' ')
+            while len(line) > self.MAX_MESSAGE_LEN:
+                split_pos = line[: self.MAX_MESSAGE_LEN].rfind(' ')
                 if split_pos <= 0:
-                    split_pos = 4096
+                    split_pos = self.MAX_MESSAGE_LEN
                 part = line[:split_pos]
                 line = line[split_pos:].lstrip()
 
@@ -147,11 +173,11 @@ class TelegramLogHandler(StreamHandler):
                 else:
                     current_chunk = part
 
-                if len(current_chunk) >= 4096:
+                if len(current_chunk) >= self.MAX_MESSAGE_LEN:
                     chunks.append(current_chunk)
                     current_chunk = ""
 
-            if len(current_chunk) + len(line) + 1 <= 4096:
+            if len(current_chunk) + len(line) + 1 <= self.MAX_MESSAGE_LEN:
                 if current_chunk:
                     current_chunk += '\n' + line
                 else:
@@ -192,7 +218,11 @@ class TelegramLogHandler(StreamHandler):
 
         payload = DEFAULT_PAYLOAD.copy()
         payload["chat_id"] = self.log_chat_id
-        payload["text"] = f"```k-server\n{message}```"
+
+        # экранируем HTML и оборачиваем в <pre>
+        escaped = html.escape(message)
+        payload["text"] = f"<pre>k-server\n{escaped}</pre>"
+
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
@@ -218,7 +248,10 @@ class TelegramLogHandler(StreamHandler):
         payload = DEFAULT_PAYLOAD.copy()
         payload["chat_id"] = self.log_chat_id
         payload["message_id"] = self.message_id
-        payload["text"] = f"```k-server\n{message}```"
+
+        escaped = html.escape(message)
+        payload["text"] = f"<pre>k-server\n{escaped}</pre>"
+
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
@@ -259,7 +292,9 @@ class TelegramLogHandler(StreamHandler):
         """Ждём пока все логи отправятся"""
         start = time.time()
         while time.time() - start < timeout:
-            if not self.message_buffer and self.floodwait == 0:
+            with self._lock:
+                empty = not self.message_buffer
+            if empty and self.floodwait == 0:
                 break
             time.sleep(1)
         self.loop.call_soon_threadsafe(self.loop.stop)
