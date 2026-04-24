@@ -6,7 +6,7 @@ import weakref
 import threading
 import html
 from logging import StreamHandler
-from aiohttp import ClientSession, FormData, ClientTimeout
+from aiohttp import ClientSession, FormData, ClientTimeout, TCPConnector
 
 nest_asyncio.apply()
 
@@ -259,13 +259,17 @@ class TelegramLogHandler(StreamHandler):
 
     async def send_request(self, url, payload):
         timeout = ClientTimeout(total=15, connect=5)
-        async with ClientSession(timeout=timeout) as session:
+        # TCPConnector с force_close=True гарантирует что соединение
+        # не привязывается к глобальному event loop (актуально при nest_asyncio)
+        connector = TCPConnector(force_close=True)
+        async with ClientSession(connector=connector, timeout=timeout) as session:
             async with session.post(url, json=payload) as response:
                 return await response.json()
 
     async def verify_bot(self):
         try:
             res = await self.send_request(f"{self.base_url}/getMe", {})
+            print(f"TGLogger verify_bot response: {res}")
         except Exception as e:
             print(f"verify_bot error: {e}")
             return None, False
