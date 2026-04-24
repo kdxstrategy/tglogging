@@ -1,4 +1,3 @@
-import io
 import time
 import asyncio
 import nest_asyncio
@@ -6,7 +5,7 @@ import weakref
 import threading
 import html
 from logging import StreamHandler
-from aiohttp import ClientSession, FormData, ClientTimeout, TCPConnector
+from aiohttp import ClientSession, ClientTimeout, TCPConnector
 
 nest_asyncio.apply()
 
@@ -50,6 +49,7 @@ class TelegramLogHandler(StreamHandler):
         self.last_update = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.initialized = False
+        self._initializing = False
         self.last_sent_content = ""
         self._handlers.add(self)
 
@@ -234,12 +234,18 @@ class TelegramLogHandler(StreamHandler):
         return chunks
 
     async def initialize_bot(self):
-        uname, is_alive = await self.verify_bot()
-        if not is_alive:
-            print("TGLogger: [ERROR] - Invalid bot token")
+        if self._initializing:
             return False
-        self.initialized = True
-        return True
+        self._initializing = True
+        try:
+            uname, is_alive = await self.verify_bot()
+            if not is_alive:
+                print("TGLogger: [ERROR] - Invalid bot token")
+                return False
+            self.initialized = True
+            return True
+        finally:
+            self._initializing = False
 
     async def send_request(self, url, payload):
         timeout = ClientTimeout(total=15, connect=5)
@@ -251,7 +257,6 @@ class TelegramLogHandler(StreamHandler):
     async def verify_bot(self):
         try:
             res = await self.send_request(f"{self.base_url}/getMe", {})
-            print(f"TGLogger verify_bot response: {res}")
         except Exception as e:
             print(f"verify_bot error: {e}")
             return None, False
