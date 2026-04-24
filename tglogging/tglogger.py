@@ -354,18 +354,33 @@ class TelegramLogHandler(StreamHandler):
             self.message_id = 0
             self.last_sent_content = ""
 
-    def flush_and_close(self, timeout: int = 100):
-        """Ждём пока все логи отправятся, включая in-flight запросы."""
-        start = time.time()
-        stable_empty_count = 0
-        while time.time() - start < timeout:
-            with self._lock:
-                empty = not self.message_buffer
-            if empty and self.floodwait == 0:
-                stable_empty_count += 1
-                if stable_empty_count >= 3:
-                    break
-            else:
-                stable_empty_count = 0
-            time.sleep(1)
-        self.loop.call_soon_threadsafe(self.loop.stop)
+    def flush_and_close(self, timeout: int = 100): ##!! NEW
+        """Ждём пока все логи отправятся, принудительно дренируя буфер.""" ##!! NEW
+        # принудительно запускаем handle_logs прямо сейчас, не ждём воркера ##!! NEW
+        if self.loop.is_running(): ##!! NEW
+            future = asyncio.run_coroutine_threadsafe(self.handle_logs(), self.loop) ##!! NEW
+            try: ##!! NEW
+                future.result(timeout=timeout) ##!! NEW
+            except Exception as e: ##!! NEW
+                print(f"flush_and_close handle_logs error: {e}") ##!! NEW
+
+        start = time.time() ##!! NEW
+        stable_empty_count = 0 ##!! NEW
+        while time.time() - start < timeout: ##!! NEW
+            with self._lock: ##!! NEW
+                empty = not self.message_buffer ##!! NEW
+            if empty and self.floodwait == 0: ##!! NEW
+                stable_empty_count += 1 ##!! NEW
+                if stable_empty_count >= 3: ##!! NEW
+                    break ##!! NEW
+            else: ##!! NEW
+                stable_empty_count = 0 ##!! NEW
+                # гоним следующий батч если буфер не пуст ##!! NEW
+                if self.loop.is_running(): ##!! NEW
+                    future = asyncio.run_coroutine_threadsafe(self.handle_logs(), self.loop) ##!! NEW
+                    try: ##!! NEW
+                        future.result(timeout=min(15, timeout)) ##!! NEW
+                    except Exception: ##!! NEW
+                        pass ##!! NEW
+            time.sleep(0.5) ##!! NEW
+        self.loop.call_soon_threadsafe(self.loop.stop) ##!! NEW
